@@ -234,6 +234,69 @@ def test_sensitivity_without_source_segment_falls_back_with_risk(client):
     assert data["exhibits"][0]["spectral_mode"] is False
 
 
+def _mixed_segment_request(damage_limit):
+    """A placement spanning one spectral day and one spectrum-less day."""
+    gallery = _open_gallery("G1", [
+        _lit_segment(1, DAY_SPECTRUM),
+        _lit_segment(2, None),
+    ])
+    exhibit = {
+        "id": "P1", "material": "photograph",
+        "dose_limit_lux_hours": "100000",
+        "historical_equivalent_damage": "0",
+        "sensitivity": {"wavelengths_nm": ["400", "700"], "values": ["1", "1"]},
+        "equivalent_damage_limit": damage_limit,
+    }
+    placement = {"exhibit_id": "P1", "gallery_id": "G1",
+                 "start": "2026-01-01T09:00:00Z", "end": "2026-01-02T17:00:00Z"}
+    return _dose_request([gallery], [exhibit], [placement], horizon_days=3)
+
+
+def test_mixed_segments_charge_non_spectral_day_at_lux_hours(client):
+    # flat sensitivity -> spectral day factor 1 -> 800 damage;
+    # spectrum-less day must be charged 1:1 -> another 800, total 1600
+    data = client.post(
+        "/dose", json=_mixed_segment_request("5000")
+    ).json()
+    assert data["status"] == "feasible"
+    exhibit = data["exhibits"][0]
+    assert exhibit["spectral_mode"] is True
+    assert exhibit["planned_dose_lux_hours"] == "1600.000000"
+    assert exhibit["planned_equivalent_damage"] == "1600.000000"
+    assert exhibit["equivalent_damage_ratio"] == "0.320000"
+
+    days = exhibit["placements"][0]["daily"]
+    spectral_day, classic_day = sorted(days, key=lambda d: d["gallery_date"])
+    spectral_seg = spectral_day["segments"][0]
+    classic_seg = classic_day["segments"][0]
+    assert spectral_seg["damage_factor"] == "1.000000"
+    assert spectral_seg["equivalent_damage"] == "800.000000"
+    # fallback segment carries damage but no action factor
+    assert classic_seg["damage_factor"] is None
+    assert classic_seg["spectrum_present"] is False
+    assert classic_seg["equivalent_damage"] == "800.000000"
+    assert classic_day["equivalent_damage"] == "800.000000"
+
+    # the missing source spectrum is still flagged
+    assert any(i["code"] == "source_spectrum_missing" for i in data["issues"])
+
+
+def test_mixed_segments_fallback_can_push_over_damage_limit(client):
+    # without the fallback the total would look like 800/1500 = 0.533 and the
+    # response would wrongly stay feasible; with the 1:1 charge it is 1600/1500
+    data = client.post(
+        "/dose", json=_mixed_segment_request("1500")
+    ).json()
+    exhibit = data["exhibits"][0]
+    assert exhibit["total_equivalent_damage"] == "1600.000000"
+    assert exhibit["equivalent_damage_ratio"] == "1.066667"
+    assert exhibit["remaining_equivalent_damage"] == "-100.000000"
+    assert exhibit["over_limit_by_equivalent_damage"] == "100.000000"
+    assert data["status"] == "infeasible"
+    assert any(i["code"] == "equivalent_damage_limit_exceeded"
+               and i["severity"] == "error" for i in data["issues"])
+
+
 def test_duplicate_wavelength_returns_422(client):
     bad = _spectral_request(
         {"wavelengths_nm": ["400", "400", "700"], "values": ["1", "1", "1"]},

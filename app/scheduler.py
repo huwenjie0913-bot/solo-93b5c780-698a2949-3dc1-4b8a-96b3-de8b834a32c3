@@ -105,6 +105,10 @@ def search_rotation(request: RotationRequest) -> dict:
         damage_limit = exhibit.equivalent_damage_limit or Decimal(0)
         damage_headroom = damage_limit - historical_damage
         spectral_exhibit = exhibit.sensitivity is not None
+        # Classic exhibits are filtered by the lux-hour margin; spectral
+        # exhibits by the equivalent-damage margin. Both use an epsilon.
+        lux_headroom = exhibit.dose_limit_lux_hours - exhibit.historical_dose_lux_hours
+        tolerance = Decimal("0.0000001")
 
         galleries = _candidate_galleries(exhibit, request.galleries)
         for gallery in galleries:
@@ -147,7 +151,7 @@ def search_rotation(request: RotationRequest) -> dict:
                     best_damage = candidate_damage
 
                 if spectral_exhibit and candidate_damage is not None:
-                    if candidate_damage > damage_headroom + Decimal("0.0000001"):
+                    if candidate_damage > damage_headroom + tolerance:
                         margin_rejections[exhibit.id] = (
                             margin_rejections.get(exhibit.id, 0) + 1
                         )
@@ -162,6 +166,24 @@ def search_rotation(request: RotationRequest) -> dict:
                             blocking_constraint="equivalent_damage_limit",
                             value=str(q(candidate_damage, QTY)),
                             limit=str(q(max(Decimal(0), damage_headroom), QTY)),
+                        ))
+                        continue
+                elif not spectral_exhibit:
+                    if lux_hours > lux_headroom + tolerance:
+                        margin_rejections[exhibit.id] = (
+                            margin_rejections.get(exhibit.id, 0) + 1
+                        )
+                        rejection_details.setdefault(exhibit.id, []).append(make_issue(
+                            "lux_hours_margin", Severity.RISK,
+                            (f"candidate block {start.isoformat()}..{end.isoformat()} in "
+                             f"gallery '{gallery.id}' would use "
+                             f"{q(lux_hours, QTY)} lux-hours but only "
+                             f"{q(max(Decimal(0), lux_headroom), QTY)} remains"),
+                            {"exhibit_id": exhibit.id, "gallery_id": gallery.id,
+                             "block_start": start.isoformat(), "block_end": end.isoformat()},
+                            blocking_constraint="dose_limit_lux_hours",
+                            value=str(q(lux_hours, QTY)),
+                            limit=str(q(max(Decimal(0), lux_headroom), QTY)),
                         ))
                         continue
                 candidates.append(candidate)
@@ -179,17 +201,22 @@ def search_rotation(request: RotationRequest) -> dict:
     seen_issue_keys: set[tuple] = set()
     for exhibit_id, detail_list in rejection_details.items():
         margin_count = margin_rejections.get(exhibit_id, 0)
-        emitted_margin = False
+        emitted_margin: set[str] = set()
         for issue in detail_list:
-            if issue.code == "equivalent_damage_margin":
-                if emitted_margin:
+            if issue.code in {"equivalent_damage_margin", "lux_hours_margin"}:
+                if issue.code in emitted_margin:
                     continue
-                emitted_margin = True
+                emitted_margin.add(issue.code)
                 if margin_count > 1:
+                    metric = (
+                        "equivalent-damage margin"
+                        if issue.code == "equivalent_damage_margin"
+                        else "lux-hour margin"
+                    )
                     issue = issue.model_copy(update={
                         "message": (f"{margin_count} candidate blocks for exhibit "
-                                    f"'{exhibit_id}' rejected by the equivalent-damage "
-                                    f"margin; first: {issue.message}")
+                                    f"'{exhibit_id}' rejected by the {metric}; "
+                                    f"first: {issue.message}")
                     })
             key = (issue.code, issue.severity, issue.message)
             if key not in seen_issue_keys:
@@ -202,7 +229,21 @@ def search_rotation(request: RotationRequest) -> dict:
     def candidate_sets_for(exhibit: Exhibit) -> list[list[dict]]:
         """All feasible ordered block lists (1..max_blocks) for an exhibit."""
         pool = per_exhibit_candidates[exhibit.id]
+        spectral_exhibit = exhibit.sensitivity is not None
+        # Cumulative budgets: the same margin rule that pruned individual
+        # blocks must also hold for the combined block path.
+        path_headroom = (
+            exhibit.equivalent_damage_limit - exhibit.historical_equivalent_damage
+            if spectral_exhibit and exhibit.equivalent_damage_limit is not None
+            else exhibit.dose_limit_lux_hours - exhibit.historical_dose_lux_hours
+        )
         paths: list[list[dict]] = []
+
+        def path_charge(block: dict) -> Decimal:
+            result = block["result"]
+            if spectral_exhibit and result.equivalent_damage is not None:
+                return result.equivalent_damage
+            return result.lux_hours
 
         def extend(path: list[dict], remaining: list[dict]) -> None:
             if len(paths) >= request.max_candidate_paths:
@@ -211,6 +252,7 @@ def search_rotation(request: RotationRequest) -> dict:
                 paths.append(list(path))
             if len(path) >= max_blocks:
                 return
+            cumulative = sum((path_charge(b) for b in path), Decimal(0))
             for index, candidate in enumerate(remaining):
                 intervals = [(b["start"], b["end"]) for b in path]
                 intervals.append((candidate["start"], candidate["end"]))
@@ -225,6 +267,9 @@ def search_rotation(request: RotationRequest) -> dict:
                     ]
                     if gaps and min(gaps) < exhibit.minimum_rest_hours:
                         continue
+                # cumulative margin guard for the combined path
+                if cumulative + path_charge(candidate) > path_headroom + Decimal("0.0000001"):
+                    continue
                 extend(path + [candidate], remaining[index + 1:])
 
         extend([], pool)
@@ -296,10 +341,20 @@ def search_rotation(request: RotationRequest) -> dict:
                 continue
             pool = per_exhibit_candidates[exhibit.id]
             best_lux, best_hours, best_damage = getattr(exhibit, "_best", (None, None, None))
+            margin_issue = next(
+                (issue for issue in rejection_details.get(exhibit.id, [])
+                 if issue.code in {"equivalent_damage_margin", "lux_hours_margin"}),
+                None,
+            )
             if not pool and not exhibit_paths[exhibit.id]:
                 reason = "no feasible candidate block"
                 code = "no_feasible_candidate"
-                constraint = "equivalent_damage_limit" if spectral_rejections(exhibit, rejection_details) else None
+                constraint = (
+                    margin_issue.blocking_constraint
+                    if margin_issue is not None
+                    else ("spectral_action_function"
+                          if spectral_rejections(exhibit, rejection_details) else None)
+                )
             else:
                 reason = "no combination satisfies gallery capacity and minimum rest"
                 code = "capacity_or_rest_conflict"
@@ -441,6 +496,25 @@ def search_rotation(request: RotationRequest) -> dict:
     else:
         status = Status.FEASIBLE
 
+    # The filter label reflects the rule actually applied: pure-classic
+    # requests use the lux-hour margin; requests with any spectral exhibit
+    # use the equivalent-damage margin. A per-exhibit map is also returned so
+    # mixed requests stay unambiguous.
+    per_exhibit_filter = {
+        exhibit.id: (
+            "equivalent_damage_margin"
+            if exhibit.sensitivity is not None
+            else "lux_hours_margin"
+        )
+        for exhibit in request.exhibits
+    }
+    active_filters = set(per_exhibit_filter.values())
+    request_filter = (
+        "lux_hours_margin"
+        if active_filters == {"lux_hours_margin"}
+        else "equivalent_damage_margin"
+    )
+
     return {
         "kind": "rotation",
         "status": status,
@@ -462,7 +536,8 @@ def search_rotation(request: RotationRequest) -> dict:
                 for exhibit in request.exhibits
             },
             "max_candidate_paths": request.max_candidate_paths,
-            "filter": "equivalent_damage_margin",
+            "filter": request_filter,
+            "filters": per_exhibit_filter,
             "margin_rejections": margin_rejections,
         },
     }
@@ -470,7 +545,8 @@ def search_rotation(request: RotationRequest) -> dict:
 
 def spectral_rejections(exhibit: Exhibit, details: dict) -> bool:
     return any(
-        issue.code in {"equivalent_damage_margin", "spectrum_no_overlap"}
+        issue.code
+        in {"equivalent_damage_margin", "lux_hours_margin", "spectrum_no_overlap"}
         for issue in details.get(exhibit.id, [])
     )
 

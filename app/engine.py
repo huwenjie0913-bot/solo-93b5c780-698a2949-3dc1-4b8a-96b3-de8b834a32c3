@@ -87,6 +87,9 @@ class SegmentResult:
     equivalent_damage: Decimal | None = None
     bands: list[BandContribution] = field(default_factory=list)
     spectrum_present: bool = False
+    # True when equivalent_damage is the legacy lux-hour fallback (factor 1)
+    # rather than a spectral action integral.
+    fallback_damage: bool = False
 
 
 @dataclass
@@ -227,6 +230,10 @@ def compute_placement(
 
     # placement-local issue dedupe so multiple segments report a gap once
     reported_gaps: set[str] = set()
+    # Counts segments integrated through the spectral action function. When a
+    # placement mixes spectral and non-spectral segments, the non-spectral
+    # ones fall back to the legacy 1:1 lux-hour rule (see post-loop pass).
+    spectral_segment_count = 0
 
     for day, day_start, day_end in local_days_between(placement_start, placement_end, tz):
         open_intervals = open_intervals_for_day(gallery, day, tz)
@@ -257,6 +264,7 @@ def compute_placement(
             if exhibit.sensitivity is not None and segment.spectrum is not None:
                 outcome = evaluator.evaluate(segment, exhibit)
                 if isinstance(outcome, SpectralEvaluation):
+                    spectral_segment_count += 1
                     factor = Decimal(str(outcome.factor))
                     equivalent_damage = factor * lux_hours
                     segment_result.factor = factor
@@ -310,6 +318,20 @@ def compute_placement(
 
         if day_result.segments:
             result.days.append(day_result)
+
+    # Legacy fallback pass for mixed placements: segments without a usable
+    # source spectrum are charged equivalent damage equal to their lux-hours
+    # (factor 1), so totals, limit ratios and status stay consistent. Only
+    # applied when the placement contains at least one spectral segment; a
+    # fully classic placement keeps null spectral totals (backward compatible).
+    all_segments = [
+        segment for day in result.days for segment in day.segments
+    ]
+    if spectral_segment_count > 0:
+        for segment in all_segments:
+            if segment.equivalent_damage is None:
+                segment.equivalent_damage = segment.lux_hours
+                segment.fallback_damage = True
 
     # Totals
     result.open_hours = sum((day.open_hours for day in result.days), Decimal(0))

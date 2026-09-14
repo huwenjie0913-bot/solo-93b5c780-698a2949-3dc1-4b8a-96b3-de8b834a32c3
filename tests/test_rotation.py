@@ -182,6 +182,82 @@ def test_classic_rotation_uses_lux_hours(client):
     assert data["exhibits"][0]["equivalent_damage_ratio"] is None
 
 
+def test_classic_rotation_prunes_blocks_over_lux_hour_margin(client):
+    # every candidate block carries 800 lux-hours; a 700 lux-hour ceiling
+    # (no historical dose) must prune every block, not silently keep one
+    classic_exhibit = [{
+        "id": "T1", "dose_limit_lux_hours": "700",
+        "minimum_display_hours": "4",
+    }]
+    request = _rotation([_gallery(spectra=False)], classic_exhibit, _CHANGE_DATES)
+    data = client.post("/rotation", json=request).json()
+    assert data["status"] == "infeasible"
+    assert data["search"]["filter"] == "lux_hours_margin"
+    assert data["search"]["filters"]["T1"] == "lux_hours_margin"
+    assert data["search"]["candidate_counts"]["T1"] == 0
+    assert data["search"]["margin_rejections"]["T1"] >= 1
+    margin_issue = next(i for i in data["issues"] if i["code"] == "lux_hours_margin")
+    assert margin_issue["severity"] == "risk"
+    assert margin_issue["blocking_constraint"] == "dose_limit_lux_hours"
+    assert margin_issue["value"] == "800.000000"
+    assert margin_issue["limit"] == "700.000000"
+
+    unplaced = data["unplaced"][0]
+    assert unplaced["exhibit_id"] == "T1"
+    assert unplaced["reason_code"] == "no_feasible_candidate"
+    assert unplaced["blocking_constraint"] == "dose_limit_lux_hours"
+    assert unplaced["best_candidate_dose_lux_hours"] == "800.000000"
+    assert unplaced["best_candidate_equivalent_damage"] is None
+
+
+def test_classic_rotation_cumulative_lux_hour_margin_guards_paths(client):
+    # single 800-lux-h block fits a 1000 ceiling, but two blocks (1600) must
+    # be pruned by the cumulative path-level margin guard
+    classic_exhibit = [{
+        "id": "T1", "dose_limit_lux_hours": "1000",
+        "minimum_display_hours": "4",
+    }]
+    request = _rotation([_gallery(spectra=False)], classic_exhibit, _CHANGE_DATES)
+    data = client.post("/rotation", json=request).json()
+    assert data["status"] == "feasible"
+    assert len(data["schedule_blocks"]) == 1
+    assert data["schedule_blocks"][0]["planned_dose_lux_hours"] == "800.000000"
+
+
+def test_historical_dose_shrinks_classic_lux_headroom(client):
+    # 500 historical + a fresh 800 block = 1300 > limit 1200 -> pruned
+    classic_exhibit = [{
+        "id": "T1", "dose_limit_lux_hours": "1200",
+        "historical_dose_lux_hours": "500",
+        "minimum_display_hours": "4",
+    }]
+    request = _rotation([_gallery(spectra=False)], classic_exhibit, _CHANGE_DATES)
+    data = client.post("/rotation", json=request).json()
+    assert data["status"] == "infeasible"
+    margin_issue = next(i for i in data["issues"] if i["code"] == "lux_hours_margin")
+    # remaining headroom is 1200 - 500 = 700
+    assert margin_issue["limit"] == "700.000000"
+
+
+def test_mixed_request_reports_per_exhibit_filters(client):
+    # one spectral exhibit and one classic exhibit share the horizon; the
+    # top-level filter is the spectral rule, the classic exhibit is labeled
+    # separately under search.filters
+    exhibits = [
+        _spectral_exhibit("P1", damage_limit="100000"),
+        {"id": "T1", "dose_limit_lux_hours": "100000",
+         "minimum_display_hours": "4"},
+    ]
+    request = _rotation([_gallery()], exhibits, _CHANGE_DATES)
+    data = client.post("/rotation", json=request).json()
+    assert data["status"] == "feasible"
+    assert data["search"]["filter"] == "equivalent_damage_margin"
+    assert data["search"]["filters"] == {
+        "P1": "equivalent_damage_margin",
+        "T1": "lux_hours_margin",
+    }
+
+
 def test_zero_illumination_intervals_not_offered_as_blocks(client):
     # change date in the middle of the night must not produce a 0-dose block
     change_dates = _CHANGE_DATES + ["2026-01-02T03:00:00Z"]

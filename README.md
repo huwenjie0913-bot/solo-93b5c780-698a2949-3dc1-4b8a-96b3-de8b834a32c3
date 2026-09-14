@@ -62,10 +62,16 @@ zero-area curves produce `spectrum_zero_power`/`spectrum_zero_sensitivity`.
 ## Rotation search
 
 Candidate blocks are enumerated between change instants, scored by the
-illumination engine, and filtered by **equivalent-damage margin**: a block is
-admitted only when `historical + block damage ≤ equivalent_damage_limit`.
-Rejections are surfaced as `equivalent_damage_margin` risk issues and counted
-in `search.margin_rejections`; `search.filter` names the active filter. A
+illumination engine, and filtered by the remaining-dose margin. Spectral
+exhibits use the **equivalent-damage margin** (a block is admitted only when
+`historical + block damage ≤ equivalent_damage_limit`); exhibits without a
+sensitivity curve use the **lux-hour margin** (`historical lux-hours + block
+lux-hours ≤ dose_limit_lux_hours`). The same rule is applied to cumulative
+multi-block paths. Rejections are surfaced as `equivalent_damage_margin` /
+`lux_hours_margin` risk issues and counted in `search.margin_rejections`;
+`search.filter` names the rule actually applied (`lux_hours_margin` for a
+fully classic request, `equivalent_damage_margin` otherwise), and
+`search.filters` gives the per-exhibit rule for mixed requests. A
 most-constrained-first backtracking assignment then honours gallery capacity
 and minimum rest gaps. Exhibits that cannot be placed appear in `unplaced`
 with the best rejected candidate's lux-hours, illuminated hours and
@@ -78,4 +84,8 @@ the service behaves exactly as before (lux-hours only), all spectral response
 fields are `null`/empty, and classic rotation filters on lux-hours. Mixing
 (e.g. a spectrum on the segment but no sensitivity curve) falls back to
 lux-hours and raises a `sensitivity_missing` / `source_spectrum_missing`
-risk issue.
+risk issue. When one placement overlaps a mix of spectral and non-spectral
+segments, the segments lacking a spectrum are charged equivalent damage
+equal to their lux-hours (legacy factor 1, `damage_factor` reported as
+`null`), so cumulative damage, limit ratios and feasibility stay consistent
+with the total light exposure.
