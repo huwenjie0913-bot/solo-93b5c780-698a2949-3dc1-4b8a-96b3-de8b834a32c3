@@ -22,6 +22,7 @@ pytest
 | GET    | `/health`   | Liveness probe |
 | POST   | `/dose`     | Dose for fixed placements (`kind: "dose"`) |
 | POST   | `/rotation` | Rotation search (`kind: "rotation"`) |
+| POST   | `/exposure-reconcile` | Reconcile measured sensor readings against the plan (`kind: "exposure_reconcile"`) |
 
 ## Spectral inputs
 
@@ -58,6 +59,44 @@ are reported as structured `spectrum_coverage_gap` risk issues whose
 curve that lacks it, alongside the common range and covered fractions.
 Curves with no overlap produce a blocking `spectrum_no_overlap` error;
 zero-area curves produce `spectrum_zero_power`/`spectrum_zero_sensitivity`.
+
+## Exposure reconciliation
+
+`POST /exposure-reconcile` replaces plan-based dose estimates with measured
+ones. Dimming, drawn shades and temporary closures make the real exposure
+deviate from the illumination calendar, so conservation staff submit the
+galleries' sensor logs alongside the galleries, exhibits and placements:
+
+* `readings[]` — `{gallery_id, timestamp, lux}` samples. Timestamps must be
+  timezone-aware and lux non-negative (HTTP 422 otherwise). Within each
+  gallery the timestamps must be strictly increasing: duplicate or
+  out-of-order readings are rejected with HTTP 422.
+* `max_sampling_gap_hours` (default `1`) — the longest interval between
+  adjacent readings that is still integrated.
+
+Adjacent readings inside a placement are integrated with the trapezoidal
+rule. Intervals longer than `max_sampling_gap_hours` — including the edges
+before the first and after the last reading — are treated as missing data:
+they are **cut out of the integral, never interpolated across**, and
+reported as `sampling_gap` risk issues. Readings that fall outside every
+placement of their gallery are reported as aggregated `unassigned_reading`
+risk issues (per gallery and local day); readings for unknown galleries are
+blocking `unknown_gallery` errors.
+
+Per exhibit the response returns `measured_lux_hours`,
+`planned_dose_lux_hours`, their `delta_lux_hours`, the `coverage_ratio`
+(integrated time ÷ placement time) and the `corrected_remaining_lux_hours`
+(`limit − historical − measured`), plus a per-day breakdown per placement.
+Limit checks run on the **measured** cumulative dose: over-limit produces
+`dose_limit_exceeded` errors, near-threshold occupancy produces
+`dose_occupancy_risk` risks. With spectra and a sensitivity curve, each
+integrated piece is charged the damage factor of the illumination segment
+covering it (lux-weighted when segments overlap; 1:1 fallback plus a
+`measured_outside_illumination` risk outside every segment), so
+`measured_equivalent_damage` and `corrected_remaining_equivalent_damage`
+reflect the measured light. The status is `infeasible` on any error,
+`incomplete` when sampling gaps or unassigned readings remain, `feasible`
+otherwise.
 
 ## Rotation search
 
