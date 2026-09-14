@@ -6,18 +6,11 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", ser_json_inf_nan="error")
-
-    @field_validator("*", mode="before")
-    @classmethod
-    def _reject_none_in_optional_lists(cls, value: Any) -> Any:
-        # Pydantic handles optionality; this hook is kept centralized for future
-        # input normalization while still rejecting unknown fields.
-        return value
+    model_config = ConfigDict(extra="forbid", ser_json_inf_nan="null")
 
 
 class Severity(str, Enum):
@@ -36,6 +29,40 @@ class MaterialType(str, Enum):
     PHOTOGRAPH = "photograph"
     DYED_SPECIMEN = "dyed_specimen"
     OTHER = "other"
+
+
+class SpectrumCurve(StrictModel):
+    """Sampled spectral function.
+
+    Wavelengths are given in nanometres and must be strictly increasing.
+    At least two samples are required so the function can be linearly
+    interpolated. Negative wavelengths/powers and duplicate wavelengths
+    are rejected at validation time; coverage gaps between curves are
+    reported as structured issues by the service layer.
+    """
+
+    wavelengths_nm: list[Decimal] = Field(min_length=2)
+    values: list[Decimal] = Field(min_length=2, description="Relative power or sensitivity.")
+
+    @model_validator(mode="after")
+    def _validate_curve(self) -> "SpectrumCurve":
+        if len(self.wavelengths_nm) != len(self.values):
+            raise ValueError("wavelengths_nm and values must have the same length")
+        previous: Decimal | None = None
+        for wavelength, value in zip(self.wavelengths_nm, self.values):
+            if not wavelength.is_finite() or wavelength < 0:
+                raise ValueError("wavelengths_nm must be finite and non-negative")
+            if not value.is_finite() or value < 0:
+                raise ValueError("spectrum values must be finite and non-negative")
+            if previous is not None and wavelength <= previous:
+                raise ValueError(
+                    f"duplicate or out-of-order wavelength at {wavelength} nm: "
+                    "wavelengths_nm must be strictly increasing"
+                )
+            previous = wavelength
+        if self.values[0] < 0 or self.values[-1] < 0:  # pragma: no cover - guarded above
+            raise ValueError("spectrum values must be non-negative")
+        return self
 
 
 class WeeklyOpen(StrictModel):
@@ -59,6 +86,14 @@ class IlluminationSegment(StrictModel):
     start: datetime
     end: datetime
     lux: Decimal = Field(ge=0)
+    spectrum: SpectrumCurve | None = Field(
+        default=None,
+        description=(
+            "Relative spectral power of the source over the illuminated period "
+            "(wavelength in nm, arbitrary relative units, normalized by the service). "
+            "Omit to fall back to plain lux-hours accounting."
+        ),
+    )
 
     @field_validator("end")
     @classmethod
@@ -94,6 +129,36 @@ class Exhibit(StrictModel):
     minimum_display_hours: Decimal = Field(default=Decimal(0), ge=0)
     minimum_rest_hours: Decimal = Field(default=Decimal(0), ge=0)
     candidate_gallery_ids: list[str] = Field(default_factory=list)
+    sensitivity: SpectrumCurve | None = Field(
+        default=None,
+        description=(
+            "Spectral damage-action (sensitivity) curve of the material, "
+            "sampled at wavelengths_nm with relative sensitivity values. "
+            "Must be supplied together with equivalent_damage_limit."
+        ),
+    )
+    equivalent_damage_limit: Decimal | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Cumulative equivalent-damage ceiling in equivalent damage units "
+            "(lux-hours referenced to the normalized spectral action function). "
+            "Required together with sensitivity; it does not replace dose_limit_lux_hours."
+        ),
+    )
+    historical_equivalent_damage: Decimal = Field(
+        default=Decimal(0),
+        ge=0,
+        description="Already accumulated equivalent damage before the horizon.",
+    )
+
+    @model_validator(mode="after")
+    def _sensitivity_and_limit_paired(self) -> "Exhibit":
+        if (self.sensitivity is None) != (self.equivalent_damage_limit is None):
+            raise ValueError(
+                "sensitivity and equivalent_damage_limit must be supplied together"
+            )
+        return self
 
 
 class Placement(StrictModel):
@@ -170,6 +235,16 @@ class TimeInterval(StrictModel):
     end: datetime
 
 
+class BandContribution(StrictModel):
+    """Equivalent-damage contribution of one wavelength band of one segment."""
+
+    wavelength_start_nm: str
+    wavelength_end_nm: str
+    band_name: str | None = None
+    equivalent_damage: str
+    equivalent_damage_fraction: str
+
+
 class SegmentContribution(StrictModel):
     segment_start: datetime
     segment_end: datetime
@@ -178,6 +253,14 @@ class SegmentContribution(StrictModel):
     lux: str
     elapsed_hours: str
     lux_hours: str
+    spectrum_present: bool = False
+    damage_factor: str | None = Field(
+        default=None,
+        description="Equivalent damage per lux-hour from the spectral action integral; "
+        "null when spectral data is absent or unusable.",
+    )
+    equivalent_damage: str | None = None
+    bands: list[BandContribution] = Field(default_factory=list)
 
 
 class DailyContribution(StrictModel):
@@ -187,6 +270,7 @@ class DailyContribution(StrictModel):
     open_hours: str
     illuminated_hours: str
     lux_hours: str
+    equivalent_damage: str | None = None
     segments: list[SegmentContribution] = Field(default_factory=list)
 
 
@@ -201,11 +285,15 @@ class PlacementDoseResult(StrictModel):
     open_hours: str
     illuminated_hours: str
     lux_hours: str
+    spectral_mode: bool = False
+    equivalent_damage: str | None = None
+    bands: list[BandContribution] = Field(default_factory=list)
     daily: list[DailyContribution] = Field(default_factory=list)
 
 
 class ExhibitDoseResult(StrictModel):
     exhibit_id: str
+    spectral_mode: bool = False
     historical_dose_lux_hours: str
     planned_dose_lux_hours: str
     total_dose_lux_hours: str
@@ -214,6 +302,17 @@ class ExhibitDoseResult(StrictModel):
     occupancy_ratio: str
     remaining_ratio: str
     over_limit_by_lux_hours: str
+    historical_equivalent_damage: str | None = None
+    planned_equivalent_damage: str | None = None
+    total_equivalent_damage: str | None = None
+    equivalent_damage_limit: str | None = None
+    remaining_equivalent_damage: str | None = None
+    equivalent_damage_ratio: str | None = Field(
+        default=None,
+        description="Cumulative fraction of the equivalent-damage ceiling already used.",
+    )
+    equivalent_damage_remaining_ratio: str | None = None
+    over_limit_by_equivalent_damage: str | None = None
     placements: list[PlacementDoseResult] = Field(default_factory=list)
     schedule_blocks: list["ScheduleBlock"] = Field(default_factory=list)
     minimum_display_elapsed_hours: str
@@ -239,6 +338,9 @@ class ScheduleBlock(StrictModel):
     elapsed_hours: str
     planned_dose_lux_hours: str
     occupancy_ratio_after_block: str
+    equivalent_damage: str | None = None
+    equivalent_damage_ratio_after_block: str | None = None
+    bands: list[BandContribution] = Field(default_factory=list)
 
 
 class RotationObjective(StrictModel):
@@ -246,6 +348,8 @@ class RotationObjective(StrictModel):
     gallery_assignments: int
     maximum_occupancy_ratio: str
     total_dose_lux_hours: str
+    total_equivalent_damage: str | None = None
+    maximum_equivalent_damage_ratio: str | None = None
 
 
 class UnplacedExhibit(StrictModel):
@@ -256,6 +360,7 @@ class UnplacedExhibit(StrictModel):
     candidate_count: int
     best_candidate_dose_lux_hours: str | None = None
     best_candidate_duration_hours: str | None = None
+    best_candidate_equivalent_damage: str | None = None
     details: list[Issue] = Field(default_factory=list)
 
 
