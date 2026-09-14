@@ -220,6 +220,64 @@ class RotationRequest(StrictModel):
         return value
 
 
+class LuxReading(StrictModel):
+    """One illuminance sample from a gallery sensor."""
+
+    gallery_id: str = Field(min_length=1)
+    timestamp: datetime = Field(description="Timezone-aware reading instant.")
+    lux: Decimal = Field(ge=0)
+
+    @field_validator("timestamp")
+    @classmethod
+    def _timestamp_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise ValueError("reading timestamp must be timezone-aware")
+        return value
+
+
+class ExposureReconcileRequest(StrictModel):
+    kind: Literal["exposure_reconcile"] = "exposure_reconcile"
+    horizon_start: datetime
+    horizon_end: datetime
+    galleries: list[Gallery]
+    exhibits: list[Exhibit]
+    placements: list[Placement]
+    readings: list[LuxReading] = Field(default_factory=list)
+    max_sampling_gap_hours: Decimal = Field(
+        default=Decimal("1"),
+        gt=0,
+        description="Longest interval between adjacent readings that is still "
+        "integrated; longer gaps are treated as missing data and are never "
+        "interpolated across.",
+    )
+    risk_threshold: Decimal = Field(
+        default=Decimal("0.90"), ge=0, le=1, description="Occupancy ratio risk threshold."
+    )
+
+    @field_validator("horizon_end")
+    @classmethod
+    def _end_after_start(cls, value: datetime, info):
+        start = info.data.get("horizon_start")
+        if start is not None and value <= start:
+            raise ValueError("horizon_end must be after horizon_start")
+        return value
+
+    @model_validator(mode="after")
+    def _readings_strictly_increasing_per_gallery(self) -> "ExposureReconcileRequest":
+        last_by_gallery: dict[str, datetime] = {}
+        for reading in self.readings:
+            previous = last_by_gallery.get(reading.gallery_id)
+            if previous is not None and reading.timestamp <= previous:
+                raise ValueError(
+                    f"duplicate or out-of-order reading timestamp at "
+                    f"{reading.timestamp.isoformat()} for gallery "
+                    f"'{reading.gallery_id}': readings must be strictly "
+                    "increasing per gallery"
+                )
+            last_by_gallery[reading.gallery_id] = reading.timestamp
+        return self
+
+
 class Issue(StrictModel):
     code: str
     severity: Severity
@@ -376,6 +434,80 @@ class RotationResponse(StrictModel):
     exhibits: list[ExhibitDoseResult] = Field(default_factory=list)
     unplaced: list[UnplacedExhibit] = Field(default_factory=list)
     search: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReconcileDailyContribution(StrictModel):
+    """Measured exposure of one placement on one gallery-local day."""
+
+    gallery_date: str
+    local_day_start: datetime
+    local_day_end: datetime
+    covered_hours: str
+    lux_hours: str
+    equivalent_damage: str | None = None
+    readings: int = 0
+
+
+class PlacementReconcileResult(StrictModel):
+    placement_index: int
+    placement_id: str | None = None
+    exhibit_id: str
+    gallery_id: str
+    start: datetime
+    end: datetime
+    elapsed_hours: str
+    covered_hours: str
+    coverage_ratio: str
+    reading_count: int
+    measured_lux_hours: str
+    planned_lux_hours: str
+    delta_lux_hours: str = Field(description="measured minus planned lux-hours.")
+    spectral_mode: bool = False
+    measured_equivalent_damage: str | None = None
+    planned_equivalent_damage: str | None = None
+    delta_equivalent_damage: str | None = None
+    daily: list[ReconcileDailyContribution] = Field(default_factory=list)
+
+
+class ExhibitReconcileResult(StrictModel):
+    exhibit_id: str
+    spectral_mode: bool = False
+    historical_dose_lux_hours: str
+    planned_dose_lux_hours: str
+    measured_lux_hours: str
+    delta_lux_hours: str = Field(description="measured minus planned lux-hours.")
+    total_measured_lux_hours: str = Field(
+        description="historical dose plus measured lux-hours."
+    )
+    dose_limit_lux_hours: str
+    corrected_remaining_lux_hours: str = Field(
+        description="dose limit minus the measured cumulative dose."
+    )
+    coverage_ratio: str | None = Field(
+        default=None,
+        description="Fraction of placement time actually integrated from readings; "
+        "null when the exhibit has no placements.",
+    )
+    measured_occupancy_ratio: str
+    over_limit_by_lux_hours: str
+    historical_equivalent_damage: str | None = None
+    planned_equivalent_damage: str | None = None
+    measured_equivalent_damage: str | None = None
+    delta_equivalent_damage: str | None = None
+    total_measured_equivalent_damage: str | None = None
+    equivalent_damage_limit: str | None = None
+    corrected_remaining_equivalent_damage: str | None = None
+    measured_equivalent_damage_ratio: str | None = None
+    over_limit_by_equivalent_damage: str | None = None
+    placements: list[PlacementReconcileResult] = Field(default_factory=list)
+
+
+class ExposureReconcileResponse(StrictModel):
+    kind: Literal["exposure_reconcile"] = "exposure_reconcile"
+    status: Status
+    horizon: TimeInterval
+    issues: list[Issue] = Field(default_factory=list)
+    exhibits: list[ExhibitReconcileResult] = Field(default_factory=list)
 
 
 class SnapshotSummary(StrictModel):
